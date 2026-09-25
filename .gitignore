@@ -1,0 +1,44 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Large datasets & generated output
+dataset/
+output/
+*.parquet
+*.tsv
+*.csv
+*.zip
+*.tar.gz
+*.gz
+
+# Model binaries & caches
+*.joblib
+*.pkl
+*.pickle
+*.onnx
+
+# Temporary, scratch & log files
+scratch/
+tmp/
+*.log
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE & Editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+.agents/
