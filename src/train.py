@@ -199,9 +199,9 @@ def main():
         block_runtime = 0.0
     else:
         t_block = time.time()
-        candidates = build_candidates(s1, s2, s3, k=args.k, return_metadata=True, verbose=True)
+        build_candidates(s1, s2, s3, k=args.k, return_metadata=True, output_parquet_path=cache_cand_path, verbose=True)
         block_runtime = time.time() - t_block
-        candidates.to_parquet(cache_cand_path)
+        candidates = pd.read_parquet(cache_cand_path)
         print(f"  [blocking] Saved candidate cache to {cache_cand_path}")
 
     # Blocking recall check
@@ -222,23 +222,36 @@ def main():
     print("=" * 70)
     sampled_pairs = sample_hard_negatives(candidates, true_pairs, neg_per_pos=args.neg_ratio, random_state=args.seed)
 
+    # Free raw candidate pairs from memory immediately
+    del candidates, cand_pair_set
+    import gc
+    gc.collect()
+
     print("\n" + "=" * 70)
     print("PHASE 3 & 4: FEATURE ENGINEERING")
     print("=" * 70)
-    cache_feat_path = f"{args.data_dir}/features_k{args.k}_neg{int(args.neg_ratio)}.parquet"
+    cache_feat_path = f"{args.data_dir}/features_k{args.k}_neg{int(args.neg_ratio)}_36feat.parquet"
     if os.path.exists(cache_feat_path):
         print(f"  [features] Loading cached features from {cache_feat_path}...")
         feature_df = pd.read_parquet(cache_feat_path)
         feat_runtime = 0.0
     else:
-        s1_lookup = s1.drop_duplicates(subset="entity_id").set_index("entity_id").to_dict("index")
-        other_pool = pd.concat([s2, s3], ignore_index=True).drop_duplicates(subset="entity_id")
-        other_lookup = other_pool.set_index("entity_id").to_dict("index")
-
         t_feat = time.time()
-        feature_df = compute_features(sampled_pairs, s1_lookup, other_lookup, chunk_size=250000, output_parquet_path=cache_feat_path)
+        from features import compute_features_country_partitioned
+        compute_features_country_partitioned(
+            sampled_pairs, s1, s2, s3,
+            output_parquet_path=cache_feat_path,
+            chunk_size=100000,
+            verbose=True,
+        )
+        feature_df = pd.read_parquet(cache_feat_path)
         feat_runtime = time.time() - t_feat
+
     print(f"  [features] {len(FEATURE_COLUMNS)} features for {len(feature_df):,} rows (runtime: {feat_runtime:.2f}s)")
+
+    # Free raw source DataFrames and sampled pairs now that features are computed
+    del s1, s2, s3, sampled_pairs
+    gc.collect()
 
     print("\n" + "=" * 70)
     print("PHASE 5: LEAK-FREE GROUPED VALIDATION SPLIT")
@@ -249,6 +262,8 @@ def main():
 
     train_df = feature_df.iloc[train_idx].copy()
     val_df = feature_df.iloc[val_idx].copy()
+    del feature_df
+    gc.collect()
 
     val_s1_entities = list(val_df["source1_entity_id"].unique())
     print(f"  Train: {len(train_df):,} pairs ({train_df.label.sum():,} pos, {(train_df.label==0).sum():,} neg) across {train_df.source1_entity_id.nunique():,} S1 entities")

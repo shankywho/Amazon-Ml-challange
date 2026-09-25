@@ -20,6 +20,8 @@ output/
 *.gz
 
 # Model binaries & caches
+models/
+cache/
 *.joblib
 *.pkl
 *.pickle
@@ -28,6 +30,8 @@ output/
 # Temporary, scratch & log files
 scratch/
 tmp/
+logs/
+logs
 *.log
 
 # macOS system files

@@ -233,6 +233,81 @@ def compute_features(
     return consolidated
 
 
+def compute_features_country_partitioned(
+    pairs_df: pd.DataFrame,
+    s1_df: pd.DataFrame,
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+    output_parquet_path: str,
+    chunk_size: int = 100000,
+    verbose: bool = True,
+):
+    """
+    Memory-safe country-partitioned feature extraction.
+    Builds country-scoped lookups filtered strictly to the candidate IDs present
+    in each country's candidate pairs, streaming feature chunks directly to Parquet.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    total_pairs = len(pairs_df)
+    if total_pairs == 0:
+        empty = pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id"] + FEATURE_COLUMNS)
+        table = pa.Table.from_pandas(empty)
+        os.makedirs(os.path.dirname(os.path.abspath(output_parquet_path)), exist_ok=True)
+        pq.write_table(table, output_parquet_path, compression="zstd")
+        return
+
+    countries = s1_df["country"].unique()
+    if verbose:
+        print(f"  [features] Streaming features across {len(countries)} country partition(s) for {total_pairs:,} pairs...")
+
+    parquet_writer = None
+    processed_count = 0
+
+    for country in countries:
+        s1_c = s1_df[s1_df["country"] == country]
+        s1_ids_c = set(s1_c["entity_id"])
+        pairs_c = pairs_df[pairs_df["source1_entity_id"].isin(s1_ids_c)]
+
+        if len(pairs_c) == 0:
+            continue
+
+        needed_cands = set(pairs_c["candidate_entity_id"])
+        s2_c = s2_df[s2_df["country"] == country]
+        s3_c = s3_df[s3_df["country"] == country]
+        pool_c = pd.concat([s2_c, s3_c], ignore_index=True)
+        pool_filtered = pool_c[pool_c["entity_id"].isin(needed_cands)].drop_duplicates(subset="entity_id")
+
+        s1_lookup_c = s1_c.drop_duplicates(subset="entity_id").set_index("entity_id").to_dict("index")
+        other_lookup_c = pool_filtered.set_index("entity_id").to_dict("index")
+        del pool_c, pool_filtered
+
+        n_chunks = math.ceil(len(pairs_c) / chunk_size)
+        for ch in range(n_chunks):
+            start = ch * chunk_size
+            end = min(start + chunk_size, len(pairs_c))
+            chunk_slice = pairs_c.iloc[start:end]
+
+            chunk_feat = compute_features_chunk(chunk_slice, s1_lookup_c, other_lookup_c)
+            table = pa.Table.from_pandas(chunk_feat)
+            if parquet_writer is None:
+                os.makedirs(os.path.dirname(os.path.abspath(output_parquet_path)), exist_ok=True)
+                parquet_writer = pq.ParquetWriter(output_parquet_path, table.schema, compression="zstd")
+            parquet_writer.write_table(table)
+            processed_count += len(chunk_feat)
+            del table, chunk_feat
+            gc.collect()
+
+        del s1_lookup_c, other_lookup_c
+        gc.collect()
+
+    if parquet_writer:
+        parquet_writer.close()
+    if verbose:
+        print(f"  [features] Wrote {processed_count:,} feature rows to {output_parquet_path}")
+
+
 FEATURE_COLUMNS = [
     # 1. Name features (10)
     "name_ratio",
