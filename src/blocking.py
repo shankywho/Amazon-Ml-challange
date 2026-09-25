@@ -32,6 +32,119 @@ import pandas as pd
 from common import add_normalized_columns
 
 
+import os
+import multiprocessing as mp
+
+
+def _score_s1_batch(batch_args) -> list:
+    """Worker function for parallel scoring of a slice of S1 queries."""
+    (
+        s1_ids_slice,
+        s1_name_toks_slice,
+        s1_addr_toks_slice,
+        s1_pref_toks_slice,
+        name_index,
+        addr_index,
+        pref_index,
+        name_idf,
+        addr_idf,
+        pref_idf,
+        pool_ids,
+        k,
+        name_weight,
+        address_weight,
+        prefix_weight,
+        multi_perspective,
+        return_metadata,
+    ) = batch_args
+
+    k_comb = max(1, int(k * 0.70))
+    k_addr = max(1, int(k * 0.30))
+    k_name = max(1, int(k * 0.20))
+
+    country_rows = []
+    for i in range(len(s1_ids_slice)):
+        s1_id = s1_ids_slice[i]
+        q_name_toks = s1_name_toks_slice[i]
+        q_addr_toks = s1_addr_toks_slice[i]
+        q_pref_toks = s1_pref_toks_slice[i]
+
+        name_scores = defaultdict(float)
+        addr_scores = defaultdict(float)
+        pref_scores = defaultdict(float)
+        all_candidate_indices = set()
+
+        for tok in q_name_toks:
+            if tok in name_idf:
+                w = name_idf[tok]
+                for c_idx in name_index[tok]:
+                    name_scores[c_idx] += w
+                    all_candidate_indices.add(c_idx)
+
+        for pref in q_pref_toks:
+            if pref in pref_idf:
+                w = pref_idf[pref]
+                for c_idx in pref_index[pref]:
+                    pref_scores[c_idx] += w
+                    all_candidate_indices.add(c_idx)
+
+        for tok in q_addr_toks:
+            if tok in addr_idf:
+                w = addr_idf[tok]
+                for c_idx in addr_index[tok]:
+                    addr_scores[c_idx] += w
+                    all_candidate_indices.add(c_idx)
+
+        if not all_candidate_indices:
+            continue
+
+        comb_scores = {}
+        for c_idx in all_candidate_indices:
+            comb_scores[c_idx] = (
+                name_weight * name_scores[c_idx]
+                + address_weight * addr_scores[c_idx]
+                + prefix_weight * pref_scores[c_idx]
+            )
+
+        if multi_perspective:
+            top_comb = sorted(comb_scores.keys(), key=comb_scores.get, reverse=True)[:k_comb]
+            top_addr = sorted(addr_scores.keys(), key=addr_scores.get, reverse=True)[:k_addr]
+            top_name = sorted(name_scores.keys(), key=name_scores.get, reverse=True)[:k_name]
+
+            selected = []
+            seen_idx = set()
+            for c_idx in top_comb + top_addr + top_name:
+                if c_idx not in seen_idx:
+                    seen_idx.add(c_idx)
+                    selected.append(c_idx)
+                    if len(selected) >= k:
+                        break
+        else:
+            selected = sorted(comb_scores.keys(), key=comb_scores.get, reverse=True)[:k]
+
+        selected.sort(key=comb_scores.get, reverse=True)
+
+        for rank, c_idx in enumerate(selected):
+            cand_id = pool_ids[c_idx]
+            if return_metadata:
+                country_rows.append({
+                    "source1_entity_id": s1_id,
+                    "candidate_entity_id": cand_id,
+                    "name_idf_score": round(name_scores[c_idx], 4),
+                    "address_idf_score": round(addr_scores[c_idx], 4),
+                    "prefix_idf_score": round(pref_scores[c_idx], 4),
+                    "total_block_score": round(comb_scores[c_idx], 4),
+                    "candidate_rank": rank,
+                })
+            else:
+                country_rows.append({
+                    "source1_entity_id": s1_id,
+                    "candidate_entity_id": cand_id,
+                })
+
+    return country_rows
+
+
 def _tokenize(text: str, min_len: int = 2) -> list:
     if not text:
         return []
@@ -130,90 +243,59 @@ def build_candidates_for_country(
     addr_idf = _calc_idf(addr_index)
     pref_idf = _calc_idf(pref_index)
 
-    # Score candidates for each S1 query
-    country_rows = []
-    for i in range(len(s1_ids)):
-        s1_id = s1_ids[i]
-        q_name_toks = s1_name_toks[i]
-        q_addr_toks = s1_addr_toks[i]
-        q_pref_toks = s1_pref_toks[i]
-
-        name_scores = defaultdict(float)
-        addr_scores = defaultdict(float)
-        pref_scores = defaultdict(float)
-        all_candidate_indices = set()
-
-        for tok in q_name_toks:
-            if tok in name_idf:
-                w = name_idf[tok]
-                for c_idx in name_index[tok]:
-                    name_scores[c_idx] += w
-                    all_candidate_indices.add(c_idx)
-
-        for pref in q_pref_toks:
-            if pref in pref_idf:
-                w = pref_idf[pref]
-                for c_idx in pref_index[pref]:
-                    pref_scores[c_idx] += w
-                    all_candidate_indices.add(c_idx)
-
-        for tok in q_addr_toks:
-            if tok in addr_idf:
-                w = addr_idf[tok]
-                for c_idx in addr_index[tok]:
-                    addr_scores[c_idx] += w
-                    all_candidate_indices.add(c_idx)
-
-        if not all_candidate_indices:
-            continue
-
-        comb_scores = {}
-        for c_idx in all_candidate_indices:
-            comb_scores[c_idx] = (
-                name_weight * name_scores[c_idx]
-                + address_weight * addr_scores[c_idx]
-                + prefix_weight * pref_scores[c_idx]
-            )
-
-        if multi_perspective:
-            k_comb = max(1, int(k * 0.70))
-            k_addr = max(1, int(k * 0.30))
-            k_name = max(1, int(k * 0.20))
-
-            top_comb = sorted(comb_scores.keys(), key=lambda idx: comb_scores[idx], reverse=True)[:k_comb]
-            top_addr = sorted(addr_scores.keys(), key=lambda idx: addr_scores[idx], reverse=True)[:k_addr]
-            top_name = sorted(name_scores.keys(), key=lambda idx: name_scores[idx], reverse=True)[:k_name]
-
-            selected = []
-            seen_idx = set()
-            for c_idx in top_comb + top_addr + top_name:
-                if c_idx not in seen_idx:
-                    seen_idx.add(c_idx)
-                    selected.append(c_idx)
-                    if len(selected) >= k:
-                        break
-        else:
-            selected = sorted(comb_scores.keys(), key=lambda idx: comb_scores[idx], reverse=True)[:k]
-
-        selected.sort(key=lambda idx: comb_scores[idx], reverse=True)
-
-        for rank, c_idx in enumerate(selected):
-            cand_id = pool_ids[c_idx]
-            if return_metadata:
-                country_rows.append({
-                    "source1_entity_id": s1_id,
-                    "candidate_entity_id": cand_id,
-                    "name_idf_score": round(name_scores[c_idx], 4),
-                    "address_idf_score": round(addr_scores[c_idx], 4),
-                    "prefix_idf_score": round(pref_scores[c_idx], 4),
-                    "total_block_score": round(comb_scores[c_idx], 4),
-                    "candidate_rank": rank,
-                })
-            else:
-                country_rows.append({
-                    "source1_entity_id": s1_id,
-                    "candidate_entity_id": cand_id,
-                })
+    # Score candidates for each S1 query (parallelized across CPU cores)
+    n_workers = min(os.cpu_count() or 4, 8)
+    if len(s1_ids) <= 100 or n_workers <= 1:
+        country_rows = _score_s1_batch((
+            s1_ids,
+            s1_name_toks,
+            s1_addr_toks,
+            s1_pref_toks,
+            name_index,
+            addr_index,
+            pref_index,
+            name_idf,
+            addr_idf,
+            pref_idf,
+            pool_ids,
+            k,
+            name_weight,
+            address_weight,
+            prefix_weight,
+            multi_perspective,
+            return_metadata,
+        ))
+    else:
+        chunk_sz = math.ceil(len(s1_ids) / n_workers)
+        tasks = []
+        for w in range(n_workers):
+            start = w * chunk_sz
+            end = min(start + chunk_sz, len(s1_ids))
+            if start >= end:
+                continue
+            tasks.append((
+                s1_ids[start:end],
+                s1_name_toks[start:end],
+                s1_addr_toks[start:end],
+                s1_pref_toks[start:end],
+                name_index,
+                addr_index,
+                pref_index,
+                name_idf,
+                addr_idf,
+                pref_idf,
+                pool_ids,
+                k,
+                name_weight,
+                address_weight,
+                prefix_weight,
+                multi_perspective,
+                return_metadata,
+            ))
+        ctx = mp.get_context("fork")
+        with ctx.Pool(processes=n_workers) as pool:
+            results = pool.map(_score_s1_batch, tasks)
+        country_rows = [row for batch in results for row in batch]
 
     del name_index, addr_index, pref_index, name_idf, addr_idf, pref_idf
     del pool_c

@@ -44,6 +44,17 @@ ADDRESS_ABBR_MAP = {
 }
 
 
+# Precompiled module-level fast regexes for single-pass alternation
+_PUNCT_RE = re.compile(r"[^\w\s]")
+_WS_RE = re.compile(r"\s+")
+
+_LEGAL_MAP = {k.replace(r"\b", ""): v for k, v in LEGAL_SUFFIX_MAP.items()}
+_LEGAL_PAT = re.compile(r"\b(" + "|".join(re.escape(k.replace(r"\b", "")) for k in LEGAL_SUFFIX_MAP) + r")\b")
+
+_ADDR_MAP = {k.replace(r"\b", ""): v for k, v in ADDRESS_ABBR_MAP.items()}
+_ADDR_PAT = re.compile(r"\b(" + "|".join(re.escape(k.replace(r"\b", "")) for k in ADDRESS_ABBR_MAP) + r")\b")
+
+
 def load_source(path: str) -> pd.DataFrame:
     """Load one source TSV file. Always use sep='\\t' — see problem statement warning
     about commas inside address/ID-list fields silently breaking a comma-separated read."""
@@ -54,22 +65,26 @@ def load_source(path: str) -> pd.DataFrame:
 
 def normalize_text(text: str, extra_map: dict | None = None) -> str:
     """Lowercase + expand abbreviations + strip extra punctuation/whitespace.
-    Applied to business_name and business_address independently."""
+    Applied to business_name and business_address independently.
+    Uses precompiled single-pass regex alternation for maximum throughput."""
     if not isinstance(text, str) or text == "":
         return ""
-    t = text.lower()
-    t = re.sub(r"[^\w\s]", " ", t)  # drop punctuation (keeps word chars + spaces)
-    if extra_map:
+    t = _PUNCT_RE.sub(" ", text.lower())
+    if extra_map is LEGAL_SUFFIX_MAP or extra_map == LEGAL_SUFFIX_MAP:
+        t = _LEGAL_PAT.sub(lambda m: _LEGAL_MAP[m.group(0)], t)
+    elif extra_map is ADDRESS_ABBR_MAP or extra_map == ADDRESS_ABBR_MAP:
+        t = _ADDR_PAT.sub(lambda m: _ADDR_MAP[m.group(0)], t)
+    elif extra_map:
         for pattern, replacement in extra_map.items():
             t = re.sub(pattern, replacement, t)
-    t = re.sub(r"\s+", " ", t).strip()  # collapse repeated whitespace
-    return t
+    return _WS_RE.sub(" ", t).strip()
 
 
 def add_normalized_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Adds name_norm, addr_norm, blocking_text columns used downstream."""
+    """Adds name_norm and addr_norm columns used downstream."""
     df = df.copy()
-    df["name_norm"] = df["business_name"].apply(lambda x: normalize_text(x, LEGAL_SUFFIX_MAP))
-    df["addr_norm"] = df["business_address"].apply(lambda x: normalize_text(x, ADDRESS_ABBR_MAP))
-    df["blocking_text"] = (df["name_norm"] + " " + df["addr_norm"]).str.strip()
+    names = df["business_name"].fillna("").astype(str).values
+    addrs = df["business_address"].fillna("").astype(str).values
+    df["name_norm"] = [normalize_text(x, LEGAL_SUFFIX_MAP) for x in names]
+    df["addr_norm"] = [normalize_text(x, ADDRESS_ABBR_MAP) for x in addrs]
     return df
