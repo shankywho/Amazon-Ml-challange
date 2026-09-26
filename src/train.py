@@ -173,7 +173,20 @@ def main():
     parser.add_argument("--neg-ratio", type=float, default=4.0, help="Hard negatives per positive")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--model-out", default="model.joblib", help="Output path for trained model & metadata")
+    parser.add_argument("--distributed-blocking", action="store_true", help="Run distributed candidate generation only and exit")
+    parser.add_argument("--machine-id", type=int, default=0, help="0-based ID of this machine in the cluster")
+    parser.add_argument("--machine-count", type=int, default=1, help="Total number of participating machines")
+    parser.add_argument("--chunk-size", type=int, default=25000, help="S1 chunk size for distributed candidate generation")
+    parser.add_argument("--checkpoint-dir", default="output/distributed_candidates", help="Directory to write chunk checkpoints")
     args = parser.parse_args()
+
+    if args.distributed_blocking:
+        if args.machine_count < 1:
+            parser.error("--machine-count must be >= 1")
+        if args.machine_id < 0 or args.machine_id >= args.machine_count:
+            parser.error(f"--machine-id must be between 0 and {args.machine_count - 1}")
+        if args.chunk_size <= 0:
+            parser.error("--chunk-size must be > 0")
 
     t_start = time.time()
     print("=" * 70)
@@ -182,13 +195,41 @@ def main():
     s1 = load_source(f"{args.data_dir}/train_source1.tsv")
     s2 = load_source(f"{args.data_dir}/train_source2.tsv")
     s3 = load_source(f"{args.data_dir}/train_source3.tsv")
+    print(f"Loaded {len(s1):,} S1 entities | {len(s2):,} S2 | {len(s3):,} S3")
+
+    if args.distributed_blocking:
+        os.environ["DISTRIBUTED_MODE"] = "1"
+        os.environ["MACHINE_ID"] = str(args.machine_id)
+        os.environ["MACHINE_COUNT"] = str(args.machine_count)
+        os.environ["S1_CHUNK_SIZE"] = str(args.chunk_size)
+        os.environ["CHECKPOINT_DIR"] = str(args.checkpoint_dir)
+
+        print("\n" + "=" * 70)
+        print("[DISTRIBUTED BLOCKING]")
+        print(f"Machine: {args.machine_id} / {args.machine_count}")
+        print(f"Chunk size: {args.chunk_size:,}")
+        print(f"Checkpoint directory: {args.checkpoint_dir}")
+        print("=" * 70)
+
+        t_block = time.time()
+        build_candidates(
+            s1,
+            s2,
+            s3,
+            k=args.k,
+            return_metadata=True,
+            output_parquet_path=None,
+            verbose=True,
+        )
+        print(f"\n[DISTRIBUTED BLOCKING] Machine {args.machine_id}/{args.machine_count} complete in {time.time() - t_block:.2f}s.")
+        sys.exit(0)
+
     gt_df = pd.read_csv(f"{args.data_dir}/train_ground_truth.tsv", sep="\t", dtype=str).fillna("")
 
     all_s1_ids = s1["entity_id"].tolist()
     true_pairs, gt_dict = parse_ground_truth(gt_df)
     singleton_count = sum(1 for s in all_s1_ids if len(gt_dict.get(s, set())) == 0)
 
-    print(f"Loaded {len(s1):,} S1 entities | {len(s2):,} S2 | {len(s3):,} S3")
     print(f"Ground truth match pairs: {len(true_pairs):,} | Singletons: {singleton_count:,} ({singleton_count/len(s1):.2%})")
 
     # Candidate generation with parquet caching
@@ -230,12 +271,35 @@ def main():
     print("\n" + "=" * 70)
     print("PHASE 3 & 4: FEATURE ENGINEERING")
     print("=" * 70)
-    cache_feat_path = f"{args.data_dir}/features_k{args.k}_neg{int(args.neg_ratio)}_36feat.parquet"
+    cache_feat_path = f"{args.data_dir}/features_k{args.k}_neg{int(args.neg_ratio)}_{len(FEATURE_COLUMNS)}feat.parquet"
+    use_cached_features = False
     if os.path.exists(cache_feat_path):
-        print(f"  [features] Loading cached features from {cache_feat_path}...")
-        feature_df = pd.read_parquet(cache_feat_path)
-        feat_runtime = 0.0
-    else:
+        print(f"  [features] Checking cached features from {cache_feat_path}...")
+        cached_df = pd.read_parquet(cache_feat_path)
+        actual_rows = len(cached_df)
+        expected_rows = len(sampled_pairs)
+        cached_cols = set(cached_df.columns)
+        schema_valid = all(col in cached_cols for col in FEATURE_COLUMNS) and ("label" in cached_cols)
+        if actual_rows == expected_rows and schema_valid:
+            feature_df = cached_df
+            feat_runtime = 0.0
+            use_cached_features = True
+            print(f"  [features] Cache VALID: {actual_rows:,} rows with complete schema ({len(FEATURE_COLUMNS)} features)")
+        else:
+            reason = []
+            if actual_rows != expected_rows:
+                reason.append(f"rows mismatch ({actual_rows:,} != {expected_rows:,})")
+            if not schema_valid:
+                missing = [c for c in FEATURE_COLUMNS if c not in cached_cols]
+                reason.append(f"schema mismatch (missing {len(missing)} features)")
+            print(f"  [features] STALE CACHE DETECTED: {', '.join(reason)}. Regenerating...")
+            del cached_df
+            try:
+                os.remove(cache_feat_path)
+            except OSError:
+                pass
+
+    if not use_cached_features:
         t_feat = time.time()
         from features import compute_features_country_partitioned
         compute_features_country_partitioned(
